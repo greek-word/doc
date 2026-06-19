@@ -155,7 +155,11 @@
               <i class="fas fa-plus-circle"></i>
             </span>
           </div>
-          <div id="folder-list" class="space-y-1"></div>
+          <div id="folder-list" class="space-y-1">
+            <div class="text-center py-4">
+              <i class="fas fa-spinner fa-spin text-gray-400"></i>
+            </div>
+          </div>
         </div>
       </nav>
 
@@ -251,17 +255,17 @@
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js";
     import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-auth.js";
-    import { getFirestore, collection, addDoc, query, orderBy, getDocs, doc as firestoreDoc, deleteDoc, updateDoc, serverTimestamp, writeBatch, where } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-firestore.js";
+    import { getFirestore, collection, addDoc, query, orderBy, getDocs, doc as firestoreDoc, deleteDoc, updateDoc, serverTimestamp, writeBatch, where, setDoc } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-firestore.js";
 
     // Firebase Configuration
     const firebaseConfig = {
       apiKey: "AIzaSyA8hSkj1otveM4q96I3vD-gaH_lxAi7C00",
-  authDomain: "library-91af8.firebaseapp.com",
-  databaseURL: "https://library-91af8-default-rtdb.firebaseio.com",
-  projectId: "library-91af8",
-  storageBucket: "library-91af8.firebasestorage.app",
-  messagingSenderId: "483457038231",
-  appId: "1:483457038231:web:3f3daa7d4b3110c71cf6d2"
+      authDomain: "library-91af8.firebaseapp.com",
+      databaseURL: "https://library-91af8-default-rtdb.firebaseio.com",
+      projectId: "library-91af8",
+      storageBucket: "library-91af8.firebasestorage.app",
+      messagingSenderId: "483457038231",
+      appId: "1:483457038231:web:3f3daa7d4b3110c71cf6d2"
     };
 
     // Initialize Firebase
@@ -284,7 +288,8 @@
     window.favorites = JSON.parse(localStorage.getItem('favorites') || '[]');
     window.recentlyViewed = JSON.parse(localStorage.getItem('recentlyViewed') || '[]');
     window.currentFolder = 'root';
-    window.folders = JSON.parse(localStorage.getItem('folders') || '["Work", "Personal", "School"]');
+    // FOLDERS NOW STORED IN FIRESTORE - Initialize as empty array until loaded
+    window.folders = [];
     window.renameDocId = null;
     window.isUploading = false;
     window.uploadProgress = {};
@@ -418,6 +423,160 @@
       }
     };
 
+    // ---------- FOLDERS IN FIRESTORE ----------
+    
+    /**
+     * Load folders from Firestore for the current user
+     */
+    window.loadFoldersFromFirestore = async () => {
+      if (!window.currentUser) return;
+      
+      try {
+        const foldersCollection = collection(db, 'users', window.currentUser.uid, 'folders');
+        const q = query(foldersCollection, orderBy('name'));
+        const snapshot = await getDocs(q);
+        
+        window.folders = snapshot.docs.map(doc => doc.data().name);
+        
+        // If no folders exist yet, create default ones
+        if (window.folders.length === 0) {
+          const defaultFolders = ['Work', 'Personal', 'School'];
+          const batch = writeBatch(db);
+          
+          for (const folderName of defaultFolders) {
+            const folderRef = firestoreDoc(foldersCollection, folderName);
+            batch.set(folderRef, {
+              name: folderName,
+              createdAt: serverTimestamp()
+            });
+          }
+          
+          await batch.commit();
+          window.folders = defaultFolders;
+        }
+        
+        renderFolders();
+      } catch (error) {
+        console.error('Error loading folders:', error);
+        window.folders = ['Work', 'Personal', 'School']; // Fallback
+        renderFolders();
+      }
+    };
+
+    /**
+     * Create a new folder in Firestore
+     */
+    window.createNewFolder = async () => {
+      const name = prompt('Enter folder name:')?.trim();
+      if (!name) return;
+      
+      if (window.folders.includes(name)) {
+        showToast('Folder already exists', 'warning');
+        return;
+      }
+      
+      try {
+        // Store in Firestore
+        const folderRef = firestoreDoc(collection(db, 'users', window.currentUser.uid, 'folders'), name);
+        await setDoc(folderRef, {
+          name: name,
+          createdAt: serverTimestamp()
+        });
+        
+        // Update local state
+        window.folders.push(name);
+        window.folders.sort();
+        renderFolders();
+        showToast('Folder created', 'success');
+      } catch (error) {
+        showToast('Error creating folder: ' + error.message, 'error');
+      }
+    };
+
+    /**
+     * Delete a folder from Firestore and move documents to root
+     */
+    window.deleteFolder = async (folderName) => {
+      if (!confirm(`Delete folder "${folderName}" and move all its documents to root?`)) return;
+      
+      try {
+        showLoading();
+        
+        // Delete folder from Firestore
+        const folderRef = firestoreDoc(db, 'users', window.currentUser.uid, 'folders', folderName);
+        await deleteDoc(folderRef);
+        
+        // Move all documents in this folder to root
+        const docsInFolder = window.allDocuments.filter(d => d.folder === folderName);
+        const batch = writeBatch(db);
+        
+        for (const doc of docsInFolder) {
+          const docRef = firestoreDoc(db, 'users', window.currentUser.uid, 'documents', doc.id);
+          batch.update(docRef, { folder: 'root' });
+        }
+        
+        if (docsInFolder.length > 0) {
+          await batch.commit();
+        }
+        
+        // Update local state
+        window.folders = window.folders.filter(f => f !== folderName);
+        window.allDocuments = window.allDocuments.map(d => 
+          d.folder === folderName ? {...d, folder: 'root'} : d
+        );
+        
+        if (window.currentFolder === folderName) {
+          window.currentFolder = 'root';
+        }
+        
+        renderFolders();
+        showToast(`Folder "${folderName}" deleted. ${docsInFolder.length} documents moved to root.`, 'success');
+        refreshCurrentView();
+      } catch (error) {
+        showToast('Error deleting folder: ' + error.message, 'error');
+      } finally {
+        hideLoading();
+      }
+    };
+
+    /**
+     * Render folders in the sidebar
+     */
+    window.renderFolders = () => {
+      const folderList = document.getElementById('folder-list');
+      if (!folderList) return;
+      
+      if (window.folders.length === 0) {
+        folderList.innerHTML = `
+          <div class="text-center py-4 text-gray-400 text-sm">
+            <p>No folders yet</p>
+          </div>
+        `;
+        return;
+      }
+      
+      folderList.innerHTML = window.folders.map(f => {
+        const escapedName = f.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        return `
+          <div class="w-full flex items-center gap-3 px-4 py-2.5 text-sm rounded-xl hover:bg-gray-100 dark:hover:bg-gray-700 transition-all-smooth group cursor-pointer ${window.currentFolder === f ? 'bg-indigo-50 dark:bg-indigo-900/40 font-medium' : ''}"
+               onclick="switchToFolder('${escapedName}')">
+            <i class="fas fa-folder text-yellow-500 w-4"></i>
+            <span class="flex-1 text-left">${f}</span>
+            <span onclick="event.stopPropagation(); deleteFolder('${escapedName}')" 
+                  class="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-all cursor-pointer" role="button" tabindex="0" title="Delete folder">
+              <i class="fas fa-times-circle text-xs"></i>
+            </span>
+          </div>
+        `;
+      }).join('');
+    };
+
+    window.switchToFolder = (folderName) => {
+      window.currentFolder = folderName;
+      switchView('library');
+      renderFolders(); // Re-render to highlight active folder
+    };
+
     // ---------- Authentication ----------
     onAuthStateChanged(auth, async (user) => {
       window.currentUser = user;
@@ -437,11 +596,19 @@
             </button>
           </div>
         `;
-        renderFolders();
-        await loadAllDocuments();
+        
+        // Load data from Firestore
+        showLoading();
+        await Promise.all([
+          loadFoldersFromFirestore(),
+          loadAllDocuments()
+        ]);
         switchView('dashboard');
       } else {
         userArea.innerHTML = '';
+        window.folders = [];
+        window.allDocuments = [];
+        document.getElementById('folder-list').innerHTML = '';
         renderAuthView();
         hideLoading();
       }
@@ -450,71 +617,12 @@
     window.logout = async () => {
       try {
         await signOut(auth);
+        window.folders = [];
+        window.allDocuments = [];
+        window.currentDocuments = [];
         showToast('Logged out successfully', 'success');
       } catch (error) {
         showToast('Error logging out', 'error');
-      }
-    };
-
-    window.renderFolders = () => {
-      const folderList = document.getElementById('folder-list');
-      if (!folderList) return;
-      folderList.innerHTML = window.folders.map(f => `
-        <div class="w-full flex items-center gap-3 px-4 py-2.5 text-sm rounded-xl hover:bg-gray-100 dark:hover:bg-gray-700 transition-all-smooth group cursor-pointer"
-             onclick="switchToFolder('${f.replace(/'/g, "\\'")}')">
-          <i class="fas fa-folder text-yellow-500 w-4"></i>
-          <span class="flex-1 text-left">${f}</span>
-          <span onclick="event.stopPropagation(); deleteFolder('${f.replace(/'/g, "\\'")}')" 
-                class="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-all cursor-pointer" role="button" tabindex="0">
-            <i class="fas fa-times-circle text-xs"></i>
-          </span>
-        </div>
-      `).join('');
-    };
-
-    window.switchToFolder = (folderName) => {
-      window.currentFolder = folderName;
-      switchView('library');
-    };
-
-    window.createNewFolder = () => {
-      const name = prompt('Enter folder name:')?.trim();
-      if (name && !window.folders.includes(name)) {
-        window.folders.push(name);
-        localStorage.setItem('folders', JSON.stringify(window.folders));
-        renderFolders();
-        showToast('Folder created', 'success');
-      } else if (name) {
-        showToast('Folder already exists', 'warning');
-      }
-    };
-
-    window.deleteFolder = (folderName) => {
-      if (confirm(`Delete folder "${folderName}" and move documents to root?`)) {
-        window.folders = window.folders.filter(f => f !== folderName);
-        localStorage.setItem('folders', JSON.stringify(window.folders));
-        
-        window.allDocuments.forEach(async (documentData) => {
-          if (documentData.folder === folderName) {
-            try {
-              await updateDoc(firestoreDoc(db, 'users', window.currentUser.uid, 'documents', documentData.id), {
-                folder: 'root'
-              });
-            } catch (error) {
-              console.error('Error moving document:', error);
-            }
-          }
-        });
-        
-        window.allDocuments = window.allDocuments.map(d => 
-          d.folder === folderName ? {...d, folder: 'root'} : d
-        );
-        
-        if (window.currentFolder === folderName) {
-          window.currentFolder = 'root';
-        }
-        renderFolders();
-        showToast('Folder deleted', 'success');
       }
     };
 
@@ -573,7 +681,6 @@
                 
                 <p class="text-center text-sm text-gray-500 mt-4">
 
-                  
                 </p>
               </div>
             </div>
@@ -634,9 +741,6 @@
 
     // ---------- CHUNKED FILE STORAGE (UNLIMITED SIZE) ----------
     
-    /**
-     * Splits base64 string into chunks and stores them across multiple Firestore documents
-     */
     window.storeChunkedFile = async (file, base64Data) => {
       const fileId = 'file_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
       const totalChunks = Math.ceil(base64Data.length / CHUNK_SIZE);
@@ -679,9 +783,6 @@
       return metadataRef;
     };
     
-    /**
-     * Reassembles chunks back into full base64 string
-     */
     window.reassembleFile = async (documentData) => {
       if (!documentData.isChunked) {
         // Legacy non-chunked file
@@ -702,9 +803,6 @@
       return chunks.join('');
     };
     
-    /**
-     * Deletes all chunks for a chunked document
-     */
     window.deleteChunks = async (docId) => {
       const chunksCollection = collection(db, 'users', window.currentUser.uid, 'documents', docId, 'chunks');
       const chunksSnapshot = await getDocs(chunksCollection);
@@ -944,13 +1042,13 @@
       
       const totalDocs = docs.length;
       const totalSize = window.totalStorageUsed;
-      const recentDocs = docs.slice(0, 10);
       const favDocs = docs.filter(d => window.favorites.includes(d.id));
       const chunkedDocs = docs.filter(d => d.isChunked);
+      const folderCount = window.folders.length;
       
       container.innerHTML = `
         <div class="animate-fade-in space-y-8">
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-6">
             <div class="bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-sm border dark:border-gray-700 hover-lift">
               <div class="flex items-center gap-4">
                 <div class="p-3 bg-indigo-100 dark:bg-indigo-900/50 rounded-xl">
@@ -958,7 +1056,7 @@
                 </div>
                 <div>
                   <h3 class="text-3xl font-bold">${totalDocs}</h3>
-                  <p class="text-sm text-gray-500">Total Documents</p>
+                  <p class="text-sm text-gray-500">Documents</p>
                 </div>
               </div>
             </div>
@@ -970,7 +1068,7 @@
                 </div>
                 <div>
                   <h3 class="text-3xl font-bold">${formatSize(totalSize)}</h3>
-                  <p class="text-sm text-gray-500">Storage Used</p>
+                  <p class="text-sm text-gray-500">Storage</p>
                 </div>
               </div>
             </div>
@@ -995,6 +1093,18 @@
                 <div>
                   <h3 class="text-3xl font-bold">${chunkedDocs.length}</h3>
                   <p class="text-sm text-gray-500">Large Files</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-sm border dark:border-gray-700 hover-lift">
+              <div class="flex items-center gap-4">
+                <div class="p-3 bg-orange-100 dark:bg-orange-900/50 rounded-xl">
+                  <i class="fas fa-folder text-2xl text-orange-600"></i>
+                </div>
+                <div>
+                  <h3 class="text-3xl font-bold">${folderCount}</h3>
+                  <p class="text-sm text-gray-500">Folders</p>
                 </div>
               </div>
             </div>
@@ -1084,7 +1194,7 @@
               <p class="text-sm text-gray-500">${filteredDocs.length} document(s)${window.searchQuery ? ' matching "' + window.searchQuery + '"' : ''}</p>
             </div>
             
-            <div class="flex gap-2">
+            <div class="flex gap-2 flex-wrap">
               <button onclick="window.viewMode='grid'; renderLibrary();" 
                       class="px-3 py-2 rounded-xl transition-all-smooth ${window.viewMode === 'grid' ? 'bg-indigo-100 dark:bg-indigo-900 text-indigo-600' : 'bg-white dark:bg-gray-800'} border">
                 <i class="fas fa-th-large"></i>
@@ -1199,7 +1309,7 @@
               </span>
             </div>
             <h4 class="font-medium text-sm truncate mb-1" title="${doc.fileName}">${doc.fileName}</h4>
-            <p class="text-xs text-gray-500 mb-3">${formatDate(doc.uploadDate)} • ${formatSize(doc.fileSize)}</p>
+            <p class="text-xs text-gray-500 mb-3">${formatDate(doc.uploadDate)} • ${formatSize(doc.fileSize)}${doc.folder !== 'root' ? ' • ' + doc.folder : ''}</p>
             <div class="flex gap-1.5 opacity-0 group-hover:opacity-100 transition-all-smooth">
               <button onclick="previewDocument('${doc.id}')" 
                       class="flex-1 py-2 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 rounded-xl hover:bg-indigo-100 transition-all-smooth text-xs font-medium">
@@ -1229,7 +1339,7 @@
             </div>
             <div class="flex-1 min-w-0">
               <h4 class="font-medium text-sm truncate">${doc.fileName}</h4>
-              <p class="text-xs text-gray-500">${formatDate(doc.uploadDate)} • ${formatSize(doc.fileSize)}</p>
+              <p class="text-xs text-gray-500">${formatDate(doc.uploadDate)} • ${formatSize(doc.fileSize)}${doc.folder !== 'root' ? ' • ' + doc.folder : ''}</p>
             </div>
             <div class="flex gap-2">
               <span onclick="toggleFavorite('${doc.id}')" 
@@ -1613,6 +1723,7 @@
     // Initialize
     console.log('🚀 Digital Library Vault - UNLIMITED with CHUNKING');
     console.log('💡 Files > 700KB are automatically split into chunks for Firestore compatibility');
+    console.log('📁 Folders are now stored in Firestore (synced across devices)');
     console.log('⌨️  Press Ctrl+U to quickly upload files');
   </script>
 </body>
